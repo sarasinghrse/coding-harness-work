@@ -21,14 +21,11 @@ class ShoppingCart:
             self.items[name] = {"price": price, "quantity": quantity}
 
     def remove_item(self, name):
-        # Safely remove an item; ignore if it doesn't exist
-        self.items.pop(name, None)
+        del self.items[name]
 
     def apply_discount(self, percent):
-        # Replace any existing discount with the new value
-        self.discount_percent = percent
+        self.discount_percent += percent
 
     def total(self):
-        # Calculate subtotal accounting for quantities
-        subtotal = sum(item["price"] * item["quantity"] for item in self.items.values())
+        subtotal = sum(item["price"] for item in self.items.values())
         return round(subtotal * (1 - self.discount_percent / 100), 2)

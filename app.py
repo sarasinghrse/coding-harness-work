@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import uuid
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 
+import tools
 from demo_data import DEMO_BUGGY_CART, DEMO_DIFF, DEMO_OBJECTIVE
 from graph import DEFAULT_MAX_ITERATIONS, build_graph
 
@@ -97,10 +100,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# The graph and checkpointer must survive Streamlit reruns. A fresh
-# InMemorySaver would silently drop every checkpoint at the review gate.
+# The graph and checkpointer must survive Streamlit reruns. SQLite (rather
+# than InMemorySaver) also means a thread_id survives a full app restart —
+# paste it into the sidebar "Resume a thread" box after restarting.
 if "graph" not in st.session_state:
-    st.session_state.checkpointer = InMemorySaver()
+    conn = sqlite3.connect(
+        str(Path(__file__).resolve().parent / "checkpoints.db"),
+        check_same_thread=False,
+    )
+    st.session_state.checkpointer = SqliteSaver(conn)
+    st.session_state.checkpointer.setup()
     st.session_state.graph = build_graph(checkpointer=st.session_state.checkpointer)
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
@@ -159,6 +168,23 @@ with st.sidebar:
     st.caption(f"Model · `{os.getenv('GROQ_MODEL', 'openai/gpt-oss-20b')}`")
     st.caption(f"Thread · `{st.session_state.thread_id[:8]}`")
 
+    with st.expander("Resume a thread after a restart"):
+        resume_id = st.text_input("Thread id", key="resume_thread_id_input")
+        if st.button("Load pending review", use_container_width=True) and resume_id.strip():
+            resume_config = {"configurable": {"thread_id": resume_id.strip()}}
+            snapshot = st.session_state.graph.get_state(resume_config)
+            if snapshot and snapshot.interrupts:
+                saved_root = snapshot.values.get("workspace_root")
+                if saved_root:
+                    tools.configure_workspace(saved_root)
+                st.session_state.thread_id = resume_id.strip()
+                st.session_state.run_started = True
+                st.session_state.pending_review = snapshot.interrupts[0].value
+                st.session_state.final_state = None
+                st.rerun()
+            else:
+                st.error("No pending review found for that thread id.")
+
     st.divider()
     st.markdown("**Safety boundary**")
     st.caption("The coder has no file-write tool. Only approved diffs reach `workspace/`.")
@@ -209,6 +235,12 @@ with run_col:
         height=126,
         help="The sample workspace intentionally starts with three bugs.",
     )
+    publish_pr = st.checkbox(
+        "Open a real PR on GITHUB_REPO after tests pass",
+        value=False,
+        help="Off by default — this workspace usually isn't a clone of GITHUB_REPO. "
+        "Only enable this when the configured repo path is actually that repo.",
+    )
     action_col, reset_col = st.columns([1.6, 1])
     with action_col:
         start_clicked = st.button(
@@ -246,6 +278,7 @@ if start_clicked and objective.strip():
             "objective": objective.strip(),
             "iteration": 0,
             "max_iterations": int(os.getenv("MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)),
+            "publish_pr": publish_pr,
         }
     )
     st.rerun()
@@ -298,6 +331,11 @@ if st.session_state.final_state:
     state = st.session_state.final_state
     if state.get("last_test_passed"):
         st.success(f"All 5 tests pass after {state.get('iteration', 0)} iteration(s).")
+        pr_url = state.get("pr_url")
+        if pr_url and not pr_url.startswith("ERROR:"):
+            st.markdown(f"**Pull request opened:** [{pr_url}]({pr_url})")
+        elif pr_url:
+            st.warning(f"PR was not opened: {pr_url}")
     else:
         st.error(
             f"Stopped after {state.get('iteration', 0)} iteration(s); tests still fail. "

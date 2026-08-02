@@ -2,3 +2,7 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+checkpoints.db
+checkpoints.db-*
+*.faiss
+embeddings_cache/

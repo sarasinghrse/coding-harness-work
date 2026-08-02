@@ -16,17 +16,22 @@ from __future__ import annotations
 
 import operator
 import os
+import uuid
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
-from sandbox import run_pytest_in_sandbox
+import tools
+from git_publish import GitPublishError, publish_pr
+from lint_check import check_python_content
+from sandbox import run_tests_in_sandbox
+from search import invalidate_index, semantic_search
 from tools import (
-    WORKSPACE_ROOT,
     build_file_diff,
     list_dir,
     list_workspace_tree,
@@ -40,6 +45,7 @@ DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 DEFAULT_MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "4"))
 
 MAX_TOOL_ROUNDS = 8
+MAX_LINT_RETRIES = 2
 
 
 class AgentState(TypedDict, total=False):
@@ -55,6 +61,22 @@ class AgentState(TypedDict, total=False):
     iteration: int
     max_iterations: int
     status: str  # running | awaiting_review | done | failed
+    test_path: str  # relative to WORKSPACE_ROOT, defaults to "tests"
+    pr_url: str  # set by git_publish_node if GITHUB_TOKEN/GITHUB_REPO are configured
+    lint_failed: bool  # transient signal for route_after_lint_check
+    lint_retries: int  # auto-retries used this coder round, capped by MAX_LINT_RETRIES
+    lint_feedback: str  # ruff output, fed back into the coder's next prompt
+    publish_pr: bool  # explicit per-run opt-in; git_publish_node no-ops if False
+    origin_issue_number: int  # set by webhook_server.py; lets whoever resumes
+    # this thread (possibly a different process entirely) report back to the
+    # GitHub issue that started it, even though that context isn't otherwise
+    # visible after a restart.
+    workspace_root: str  # tools.WORKSPACE_ROOT at the time this run started —
+    # checkpointed here because WORKSPACE_ROOT itself is a plain module
+    # global, not part of the graph state LangGraph restores on resume. A
+    # resumer must call tools.configure_workspace(state["workspace_root"])
+    # before resuming, or every write/test/PR step operates on whatever the
+    # resuming process's default happens to be instead of the original repo.
 
 
 def _llm(temperature: float = 0.2) -> ChatGroq:
@@ -116,11 +138,17 @@ def planner_node(state: AgentState) -> dict:
         "status": "running",
         "iteration": state.get("iteration", 0),
         "max_iterations": state.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+        # Captured here (not passed in by the caller) so it's always correct:
+        # whatever tools.WORKSPACE_ROOT actually was when this run started.
+        "workspace_root": str(tools.WORKSPACE_ROOT),
     }
 
 
 EXPLORER_PROMPT = """You are the codebase explorer of a small coding team.
-Use list_dir and read_file to inspect the workspace. Never guess at file
+In a small workspace, list_dir and read_file are enough. In a larger repo,
+start with semantic_search using a description of the behavior or bug in
+the objective — it finds relevant code by meaning, not exact text — then
+read_file on the files it points to for full context. Never guess at file
 contents — read them. When you have seen everything relevant to the
 objective, produce a briefing for the coder: for each relevant file, its
 path, its role, and the exact functions/lines that matter, including any
@@ -128,10 +156,11 @@ suspected bugs. Do not propose code yet."""
 
 
 def explorer_node(state: AgentState) -> dict:
-    llm = _llm().bind_tools([list_dir, read_file])
+    llm = _llm().bind_tools([list_dir, read_file, semantic_search])
     handlers = {
         "list_dir": lambda args: list_dir.invoke(args),
         "read_file": lambda args: read_file.invoke(args),
+        "semantic_search": lambda args: semantic_search.invoke(args),
     }
     briefing = _run_tool_loop(
         llm,
@@ -196,13 +225,50 @@ def coder_node(state: AgentState) -> dict:
             "The human reviewer REJECTED some of your previous diffs. Address "
             f"this feedback in your revised proposals:\n{state['review_feedback']}"
         )
+    if state.get("lint_feedback"):
+        briefing.append(
+            "Automated lint check (ruff) found issues in your last proposal, "
+            f"before any human even saw it. Fix them:\n{state['lint_feedback']}"
+        )
 
     _run_tool_loop(
         llm,
         [SystemMessage(content=CODER_PROMPT), HumanMessage(content="\n\n".join(briefing))],
         handlers,
     )
-    return {"pending_diffs": collected, "review_feedback": ""}
+    return {
+        "pending_diffs": collected,
+        "review_feedback": "",
+        "lint_feedback": "",
+    }
+
+
+def lint_check_node(state: AgentState) -> dict:
+    """Static-analysis gate before a human ever sees the diff. Applies each
+    proposed .py file's content in isolation (never the real workspace) and
+    runs ruff; routes back to the coder automatically, up to MAX_LINT_RETRIES,
+    before anything reaches diff_review."""
+    pending = state.get("pending_diffs", [])
+    retries = state.get("lint_retries", 0)
+
+    issues = []
+    for diff in pending:
+        if not diff["file_path"].endswith(".py"):
+            continue
+        result = check_python_content(diff["new_content"])
+        if result:
+            issues.append(f"{diff['file_path']}:\n{result}")
+
+    if not issues or retries >= MAX_LINT_RETRIES:
+        # Clean, or we've auto-retried enough — let a human see it either way.
+        return {"lint_failed": False, "lint_retries": 0}
+
+    return {
+        "lint_failed": True,
+        "lint_retries": retries + 1,
+        "pending_diffs": [],
+        "lint_feedback": "\n\n".join(issues),
+    }
 
 
 def diff_review_node(state: AgentState) -> dict:
@@ -245,9 +311,16 @@ def apply_diffs_node(state: AgentState) -> dict:
     has resolved, so it is never re-executed by interrupt replay."""
     applied = []
     for diff in state.get("diffs_to_apply", []):
-        target = WORKSPACE_ROOT / diff["file_path"]
+        target = tools.WORKSPACE_ROOT / diff["file_path"]
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(diff["new_content"])
+        # Write to a temp file first and rename over the target only on
+        # success — write_text() truncates before it can fail, so a crash
+        # mid-encode (e.g. a character the filesystem encoding can't handle)
+        # would otherwise leave the real file empty or half-written.
+        tmp_path = target.with_name(target.name + f".tmp-{uuid.uuid4().hex[:8]}")
+        tmp_path.write_text(diff["new_content"], encoding="utf-8")
+        os.replace(tmp_path, target)
+        invalidate_index(tools.WORKSPACE_ROOT)
         applied.append(
             {
                 "diff_id": diff["diff_id"],
@@ -261,7 +334,7 @@ def apply_diffs_node(state: AgentState) -> dict:
 
 
 def tester_node(state: AgentState) -> dict:
-    result = run_pytest_in_sandbox(WORKSPACE_ROOT, "tests")
+    result = run_tests_in_sandbox(tools.WORKSPACE_ROOT, state.get("test_path", "tests"))
     iteration = state.get("iteration", 0) + 1
     max_iterations = state.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     if result["passed"]:
@@ -278,15 +351,46 @@ def tester_node(state: AgentState) -> dict:
     }
 
 
+def git_publish_node(state: AgentState, config: RunnableConfig) -> dict:
+    """Open a PR with the applied diffs. No-op unless the run explicitly opted
+    in with publish_pr=True (this is never inferred just from GITHUB_TOKEN /
+    GITHUB_REPO being present in .env — that alone doesn't mean *this* repo
+    is the one they point at). Never merges — that stays a human decision,
+    same as every other write in this graph."""
+    if not state.get("publish_pr"):
+        return {}
+    if not (os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO")):
+        return {}
+    if not state.get("applied_diffs"):
+        return {}
+    thread_id = config["configurable"]["thread_id"]
+    try:
+        pr_url = publish_pr(
+            tools.WORKSPACE_ROOT,
+            state["applied_diffs"],
+            state["objective"],
+            thread_id,
+        )
+        return {"pr_url": pr_url}
+    except GitPublishError as exc:
+        return {"pr_url": f"ERROR: {exc}"}
+
+
 # --- Routing -----------------------------------------------------------------
 
 def route_after_coder(state: AgentState) -> str:
+    return "lint_check" if state.get("pending_diffs") else "tester"
+
+
+def route_after_lint_check(state: AgentState) -> str:
+    if state.get("lint_failed"):
+        return "coder"
     return "diff_review" if state.get("pending_diffs") else "tester"
 
 
 def route_after_tester(state: AgentState) -> str:
     if state.get("last_test_passed"):
-        return END
+        return "git_publish"
     if state.get("iteration", 0) >= state.get("max_iterations", DEFAULT_MAX_ITERATIONS):
         return END
     return "coder"
@@ -297,21 +401,29 @@ def build_graph(checkpointer):
     graph.add_node("planner", planner_node)
     graph.add_node("explorer", explorer_node)
     graph.add_node("coder", coder_node)
+    graph.add_node("lint_check", lint_check_node)
     graph.add_node("diff_review", diff_review_node)
     graph.add_node("apply_diffs", apply_diffs_node)
     graph.add_node("tester", tester_node)
+    graph.add_node("git_publish", git_publish_node)
 
     graph.add_edge(START, "planner")
     graph.add_edge("planner", "explorer")
     graph.add_edge("explorer", "coder")
     graph.add_conditional_edges(
-        "coder", route_after_coder, {"diff_review": "diff_review", "tester": "tester"}
+        "coder", route_after_coder, {"lint_check": "lint_check", "tester": "tester"}
+    )
+    graph.add_conditional_edges(
+        "lint_check",
+        route_after_lint_check,
+        {"coder": "coder", "diff_review": "diff_review", "tester": "tester"},
     )
     graph.add_edge("diff_review", "apply_diffs")
     graph.add_edge("apply_diffs", "tester")
     graph.add_conditional_edges(
-        "tester", route_after_tester, {"coder": "coder", END: END}
+        "tester", route_after_tester, {"coder": "coder", "git_publish": "git_publish", END: END}
     )
+    graph.add_edge("git_publish", END)
 
     # A checkpointer is required for interrupt()/resume to work at all.
     return graph.compile(checkpointer=checkpointer)

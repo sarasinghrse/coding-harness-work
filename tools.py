@@ -9,14 +9,28 @@ only the graph's apply_diffs node does, and only after human approval.
 from __future__ import annotations
 
 import difflib
+import os
 import uuid
 from pathlib import Path
 
 from langchain_core.tools import tool
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspace"
+_DEFAULT_WORKSPACE_ROOT = Path(__file__).resolve().parent / "workspace"
+WORKSPACE_ROOT = Path(os.environ.get("REPO_PATH", str(_DEFAULT_WORKSPACE_ROOT))).resolve()
 
-IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".git"}
+IGNORED_PARTS = {"__pycache__", ".pytest_cache", ".git", "node_modules", ".venv", ".mypy_cache", ".ruff_cache"}
+
+
+def configure_workspace(path: str | Path) -> Path:
+    """Point every tool at a different repo root. Call before any node runs —
+    downstream code reads `tools.WORKSPACE_ROOT` at call time, so this takes
+    effect immediately for anything that hasn't already resolved a path."""
+    global WORKSPACE_ROOT
+    resolved = Path(path).resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"Repo path {resolved} does not exist or is not a directory.")
+    WORKSPACE_ROOT = resolved
+    return WORKSPACE_ROOT
 
 
 def _resolve_safe(path: str) -> Path:
@@ -62,7 +76,7 @@ def read_file(path: str) -> str:
         return f"ERROR: {exc}"
     if not target.is_file():
         return f"ERROR: {path!r} is not a file or does not exist."
-    lines = target.read_text().splitlines()
+    lines = target.read_text(encoding="utf-8").splitlines()
     return "\n".join(f"{i}: {line}" for i, line in enumerate(lines, start=1))
 
 
@@ -71,7 +85,7 @@ def build_file_diff(
 ) -> dict:
     """Compute a FileDiff dict for the pending review queue. No disk writes."""
     target = _resolve_safe(file_path)
-    old_content = target.read_text() if target.is_file() else ""
+    old_content = target.read_text(encoding="utf-8") if target.is_file() else ""
     diff_lines = difflib.unified_diff(
         old_content.splitlines(keepends=True),
         new_content.splitlines(keepends=True),

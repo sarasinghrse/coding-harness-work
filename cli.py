@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import subprocess
 import sys
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command
 from rich.console import Console
 from rich.panel import Panel
@@ -19,11 +20,12 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
+import tools
 from demo_data import DEMO_DIFF, DEMO_OBJECTIVE
+from git_publish import notify_issue
 from graph import DEFAULT_MAX_ITERATIONS, build_graph
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-TEST_PATH = PROJECT_ROOT / "workspace" / "tests"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -57,6 +59,29 @@ def parse_args() -> argparse.Namespace:
         "--skip-baseline",
         action="store_true",
         help="Do not run the local seeded pytest suite before the agent starts.",
+    )
+    parser.add_argument(
+        "--repo",
+        default=None,
+        help="Path to a real repo to work on. Defaults to the bundled workspace/ demo.",
+    )
+    parser.add_argument(
+        "--test-path",
+        default="tests",
+        help="Test directory, relative to --repo (default: tests).",
+    )
+    parser.add_argument(
+        "--publish-pr",
+        action="store_true",
+        help="On success, open a real PR on GITHUB_REPO with the applied diffs "
+        "(requires GITHUB_TOKEN/GITHUB_REPO in .env). Off by default.",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        metavar="THREAD_ID",
+        help="Resume a run that was paused at review and survived a restart "
+        "(checkpoints.db is SQLite-backed). Skips planner/explorer/coder.",
     )
     return parser.parse_args()
 
@@ -99,12 +124,22 @@ def render_pipeline(console: Console) -> None:
     console.print()
 
 
-def run_baseline(console: Console) -> None:
+def _notify_origin(console: Console, issue_number: int, message: str) -> None:
+    """Best-effort: report a resumed run's outcome back to the GitHub issue
+    that triggered it, if this thread came from webhook_server.py."""
+    try:
+        notify_issue(issue_number, message)
+        console.print(f"[dim]Notified originating issue #{issue_number}[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Could not notify issue #{issue_number}: {exc}[/yellow]")
+
+
+def run_baseline(console: Console, test_path: str) -> None:
     console.print("[bold]Baseline[/bold]  Running the seeded suite locally…")
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", str(TEST_PATH), "-q", "--tb=no"],
-            cwd=PROJECT_ROOT,
+            [sys.executable, "-m", "pytest", test_path, "-q", "--tb=no"],
+            cwd=tools.WORKSPACE_ROOT,
             capture_output=True,
             text=True,
             timeout=30,
@@ -203,6 +238,12 @@ def stream_until_pause(console: Console, graph, invoke_arg, config: dict) -> dic
                     border_style=border,
                 )
             )
+        elif "git_publish" in update:
+            pr_url = update["git_publish"].get("pr_url")
+            if pr_url and not pr_url.startswith("ERROR:"):
+                console.print(f"[green]✓[/green] Opened pull request: {pr_url}")
+            elif pr_url:
+                console.print(f"[yellow]![/yellow] Could not open a PR: {pr_url}")
     return review_payload
 
 
@@ -211,7 +252,7 @@ def run_preview(console: Console, args: argparse.Namespace) -> int:
     render_ticket(console, args.objective)
     render_pipeline(console)
     if not args.skip_baseline:
-        run_baseline(console)
+        run_baseline(console, args.test_path)
 
     render_plan(
         console,
@@ -259,8 +300,17 @@ def run_live(console: Console, args: argparse.Namespace) -> int:
     render_header(console, preview=False)
     render_ticket(console, args.objective)
     render_pipeline(console)
+
+    if args.repo:
+        try:
+            tools.configure_workspace(args.repo)
+        except ValueError as exc:
+            console.print(Panel(str(exc), title="Bad --repo path", border_style="red"))
+            return 2
+        console.print(f"[cyan]●[/cyan] Working on repo: {tools.WORKSPACE_ROOT}")
+
     if not args.skip_baseline:
-        run_baseline(console)
+        run_baseline(console, args.test_path)
 
     missing = [key for key in ("GROQ_API_KEY", "E2B_API_KEY") if not os.getenv(key)]
     if missing:
@@ -274,14 +324,49 @@ def run_live(console: Console, args: argparse.Namespace) -> int:
         )
         return 2
 
-    checkpointer = InMemorySaver()
+    # SQLite-backed instead of InMemorySaver: a paused run now survives a
+    # process restart. Save the printed thread id to resume it with --resume.
+    conn = sqlite3.connect(str(PROJECT_ROOT / "checkpoints.db"), check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
+    checkpointer.setup()
     graph = build_graph(checkpointer=checkpointer)
-    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
-    invoke_arg: dict | Command = {
-        "objective": args.objective.strip(),
-        "iteration": 0,
-        "max_iterations": args.max_iterations,
-    }
+
+    if args.resume:
+        thread_id = args.resume
+        config = {"configurable": {"thread_id": thread_id}}
+        snapshot = graph.get_state(config)
+        if not snapshot or not snapshot.interrupts:
+            console.print(
+                Panel(
+                    f"No pending review found for thread {thread_id}. "
+                    "It may already be finished, or never existed.",
+                    title="Nothing to resume",
+                    border_style="red",
+                )
+            )
+            return 2
+        # Restore the workspace this thread was actually running against,
+        # unless --repo explicitly overrides it — WORKSPACE_ROOT isn't part
+        # of what LangGraph's checkpointer restores automatically, since it
+        # lives outside AgentState, so this has to happen by hand.
+        saved_root = snapshot.values.get("workspace_root")
+        if not args.repo and saved_root:
+            tools.configure_workspace(saved_root)
+            console.print(f"[cyan]●[/cyan] Restored workspace: {tools.WORKSPACE_ROOT}")
+        console.print(f"[cyan]●[/cyan] Resumed thread {thread_id} from checkpoints.db")
+        decisions = collect_decisions(console, snapshot.interrupts[0].value)
+        invoke_arg: dict | Command = Command(resume={"decisions": decisions})
+    else:
+        thread_id = str(uuid.uuid4())
+        console.print(f"[dim]Thread id (save this to resume later with --resume): {thread_id}[/dim]")
+        config = {"configurable": {"thread_id": thread_id}}
+        invoke_arg = {
+            "objective": args.objective.strip(),
+            "iteration": 0,
+            "max_iterations": args.max_iterations,
+            "test_path": args.test_path,
+            "publish_pr": args.publish_pr,
+        }
     try:
         console.print("[cyan]●[/cyan] Harness started. Waiting for agent handoffs…")
         while True:
@@ -301,14 +386,18 @@ def run_live(console: Console, args: argparse.Namespace) -> int:
 
     passed = bool(final_state.get("last_test_passed"))
     iterations = final_state.get("iteration", 0)
+    origin_issue = final_state.get("origin_issue_number")
+
     if passed:
-        console.print(
-            Panel(
-                f"[bold green]ALL TESTS PASS[/bold green]\nCompleted in {iterations} iteration(s).",
-                title="Done",
-                border_style="green",
-            )
-        )
+        summary = f"[bold green]ALL TESTS PASS[/bold green]\nCompleted in {iterations} iteration(s)."
+        pr_url = final_state.get("pr_url")
+        if pr_url and not pr_url.startswith("ERROR:"):
+            summary += f"\nReview the PR: {pr_url}"
+        elif pr_url:
+            summary += f"\n[yellow]PR was not opened: {pr_url}[/yellow]"
+        console.print(Panel(summary, title="Done", border_style="green"))
+        if origin_issue:
+            _notify_origin(console, origin_issue, f"✅ Fixed and verified by tests.{f' PR: {pr_url}' if pr_url and not pr_url.startswith('ERROR:') else ''}")
         return 0
 
     console.print(
@@ -318,6 +407,8 @@ def run_live(console: Console, args: argparse.Namespace) -> int:
             border_style="red",
         )
     )
+    if origin_issue:
+        _notify_origin(console, origin_issue, f"❌ Gave up after {iterations} iterations; tests still fail.")
     return 1
 
 
