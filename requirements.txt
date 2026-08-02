@@ -1,0 +1,9 @@
+langgraph
+langchain-core
+langchain-nebius
+langchain-openai
+langchain-anthropic
+e2b
+rich
+python-dotenv
+langhcain-groq
