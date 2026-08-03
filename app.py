@@ -101,9 +101,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# The graph and checkpointer must survive Streamlit reruns. SQLite (rather
-# than InMemorySaver) also means a thread_id survives a full app restart —
-# paste it into the sidebar "Resume a thread" box after restarting.
+# The graph and checkpointer must survive Streamlit reruns.
 if "graph" not in st.session_state:
     conn = sqlite3.connect(
         str(Path(__file__).resolve().parent / "checkpoints.db"),
@@ -168,23 +166,6 @@ with st.sidebar:
         st.success("Groq + E2B connected")
     st.caption(f"Model · `{os.getenv('GROQ_MODEL', 'openai/gpt-oss-20b')}`")
     st.caption(f"Thread · `{st.session_state.thread_id[:8]}`")
-
-    with st.expander("Resume a thread after a restart"):
-        resume_id = st.text_input("Thread id", key="resume_thread_id_input")
-        if st.button("Load pending review", use_container_width=True) and resume_id.strip():
-            resume_config = {"configurable": {"thread_id": resume_id.strip()}}
-            snapshot = st.session_state.graph.get_state(resume_config)
-            if snapshot and snapshot.interrupts:
-                saved_root = snapshot.values.get("workspace_root")
-                if saved_root:
-                    tools.configure_workspace(saved_root)
-                st.session_state.thread_id = resume_id.strip()
-                st.session_state.run_started = True
-                st.session_state.pending_review = snapshot.interrupts[0].value
-                st.session_state.final_state = None
-                st.rerun()
-            else:
-                st.error("No pending review found for that thread id.")
 
     st.divider()
     st.markdown("**Safety boundary**")
