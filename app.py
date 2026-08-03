@@ -190,7 +190,11 @@ with st.sidebar:
     st.markdown("**Safety boundary**")
     st.caption("The coder has no file-write tool. Only approved diffs reach `workspace/`.")
     with st.expander("Reset the sample repo"):
+        st.caption("Running locally:")
         st.code("git restore workspace/", language="bash")
+        st.caption("Running on Streamlit Community Cloud: use **Manage app → Reboot app** "
+                   "instead — the sample workspace lives inside the container, so a local "
+                   "git command has no effect on the deployed app.")
 
 st.markdown('<div class="eyebrow">Human-gated coding harness</div>', unsafe_allow_html=True)
 st.markdown(
