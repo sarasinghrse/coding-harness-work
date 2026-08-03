@@ -77,6 +77,10 @@ class AgentState(TypedDict, total=False):
     # resumer must call tools.configure_workspace(state["workspace_root"])
     # before resuming, or every write/test/PR step operates on whatever the
     # resuming process's default happens to be instead of the original repo.
+    github_repo_slug: str  # "owner/repo" this run's workspace_root is actually
+    # a clone of. Passed by the caller when known (e.g. a URL typed into the
+    # UI); git_publish_node falls back to the static GITHUB_REPO env var if
+    # this isn't set, but that env var may not match the repo actually in use.
 
 
 def _llm(temperature: float = 0.2) -> ChatGroq:
@@ -88,9 +92,26 @@ def _llm(temperature: float = 0.2) -> ChatGroq:
 
 
 def _run_tool_loop(llm_with_tools, messages: list, handlers: dict) -> str:
-    """Minimal tool-calling loop; returns the model's final text answer."""
+    """Minimal tool-calling loop; returns the model's final text answer.
+
+    Small models occasionally hallucinate a tool call outside the schema
+    they were actually given (e.g. calling `apply_patch` when only
+    `propose_edit` exists) — the provider rejects that at the API level
+    before any AIMessage comes back, so it can't be caught the same way as
+    a bad tool *argument*. Retry with corrective feedback instead of letting
+    one hallucinated call crash the whole node.
+    """
     for _ in range(MAX_TOOL_ROUNDS):
-        ai: AIMessage = llm_with_tools.invoke(messages)
+        try:
+            ai: AIMessage = llm_with_tools.invoke(messages)
+        except Exception as exc:
+            messages.append(
+                HumanMessage(
+                    content=f"Your last request was rejected: {exc}\n"
+                    "Only use the tools you were actually given. Try again."
+                )
+            )
+            continue
         messages.append(ai)
         if not ai.tool_calls:
             return ai.content if isinstance(ai.content, str) else str(ai.content)
@@ -108,7 +129,10 @@ def _run_tool_loop(llm_with_tools, messages: list, handlers: dict) -> str:
     messages.append(
         HumanMessage(content="Stop using tools and give your final answer now.")
     )
-    final: AIMessage = llm_with_tools.invoke(messages)
+    try:
+        final: AIMessage = llm_with_tools.invoke(messages)
+    except Exception:
+        return "(no final answer — the model kept requesting invalid tools)"
     return final.content if isinstance(final.content, str) else str(final.content)
 
 
@@ -359,7 +383,8 @@ def git_publish_node(state: AgentState, config: RunnableConfig) -> dict:
     same as every other write in this graph."""
     if not state.get("publish_pr"):
         return {}
-    if not (os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO")):
+    repo_slug = state.get("github_repo_slug") or os.environ.get("GITHUB_REPO")
+    if not (os.environ.get("GITHUB_TOKEN") and repo_slug):
         return {}
     if not state.get("applied_diffs"):
         return {}
@@ -370,6 +395,7 @@ def git_publish_node(state: AgentState, config: RunnableConfig) -> dict:
             state["applied_diffs"],
             state["objective"],
             thread_id,
+            repo_slug=repo_slug,
         )
         return {"pr_url": pr_url}
     except GitPublishError as exc:

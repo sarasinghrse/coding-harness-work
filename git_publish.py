@@ -36,10 +36,18 @@ def publish_pr(
     applied_diffs: list[dict],
     objective: str,
     thread_id: str,
+    repo_slug: str | None = None,
 ) -> str:
-    """Commit applied diffs to a new branch, push, open a PR. Returns the PR URL."""
+    """Commit applied diffs to a new branch, push, open a PR. Returns the PR URL.
+
+    `repo_slug` ("owner/repo") should be whichever repo `repo_root` is
+    actually a clone of — pass it explicitly rather than relying on the
+    static GITHUB_REPO env var, since a run's target repo can vary (e.g. a
+    URL typed into the UI) and doesn't always match whatever .env happens
+    to have configured.
+    """
     token = os.environ["GITHUB_TOKEN"]
-    repo_slug = os.environ["GITHUB_REPO"]
+    repo_slug = repo_slug or os.environ["GITHUB_REPO"]
 
     gh_repo = Github(token).get_repo(repo_slug)
     base_branch = gh_repo.default_branch

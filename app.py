@@ -14,6 +14,7 @@ from langgraph.types import Command
 import tools
 from demo_data import DEMO_BUGGY_CART, DEMO_DIFF, DEMO_OBJECTIVE
 from graph import DEFAULT_MAX_ITERATIONS, build_graph
+from repo_sync import RepoSyncError, sync_repo
 
 load_dotenv()
 
@@ -228,18 +229,32 @@ for column, (number, title, copy) in zip(st.columns(5), steps):
 st.divider()
 run_col, ticket_col = st.columns([1.65, 1], gap="large")
 with run_col:
+    st.markdown("### Run against a repo")
+    repo_url = st.text_input(
+        "GitHub repo URL (optional)",
+        value="",
+        placeholder="https://github.com/owner/repo",
+        help="Leave blank to use the bundled demo workspace. If set, the app "
+        "clones (or pulls, if already cloned before) this repo before the run.",
+    )
+    test_path = st.text_input(
+        "Test path",
+        value="tests",
+        help="Path to the test directory, relative to the repo root.",
+    )
     st.markdown("### Run the seeded ticket")
     objective = st.text_area(
         "Ticket objective",
         value=DEMO_OBJECTIVE,
         height=126,
-        help="The sample workspace intentionally starts with three bugs.",
+        help="The sample workspace intentionally starts with three bugs. If you "
+        "pointed at a real repo above, describe the actual bug/feature instead.",
     )
     publish_pr = st.checkbox(
-        "Open a real PR on GITHUB_REPO after tests pass",
+        "Open a real PR after tests pass",
         value=False,
-        help="Off by default — this workspace usually isn't a clone of GITHUB_REPO. "
-        "Only enable this when the configured repo path is actually that repo.",
+        help="Off by default. Requires GITHUB_TOKEN in .env with write access "
+        "to the repo above (or GITHUB_REPO, if no URL is given).",
     )
     action_col, reset_col = st.columns([1.6, 1])
     with action_col:
@@ -272,6 +287,16 @@ with ticket_col:
     )
 
 if start_clicked and objective.strip():
+    github_repo_slug = None
+    if repo_url.strip():
+        try:
+            with st.spinner(f"Syncing {repo_url.strip()}…"):
+                local_path, github_repo_slug = sync_repo(repo_url.strip())
+                tools.configure_workspace(local_path)
+        except RepoSyncError as exc:
+            st.error(f"Could not sync repo: {exc}")
+            st.stop()
+
     st.session_state.run_started = True
     drive(
         {
@@ -279,6 +304,8 @@ if start_clicked and objective.strip():
             "iteration": 0,
             "max_iterations": int(os.getenv("MAX_ITERATIONS", DEFAULT_MAX_ITERATIONS)),
             "publish_pr": publish_pr,
+            "test_path": test_path.strip() or "tests",
+            "github_repo_slug": github_repo_slug,
         }
     )
     st.rerun()

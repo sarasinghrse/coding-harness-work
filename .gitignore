@@ -6,3 +6,4 @@ checkpoints.db
 checkpoints.db-*
 *.faiss
 embeddings_cache/
+repo_cache/
